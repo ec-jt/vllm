@@ -1,8 +1,7 @@
 DOCKER_BUILDKIT=1 \
   docker build \
   --file docker/Dockerfile \
-  --target vllm-dc \
-  --tag vllm/vllm-dc:v0.0 \
+  --tag vllm/vllm-dc:v0.0.1a \
   --build-arg max_jobs=12 \
   --build-arg nvcc_threads=12 \
   . 2>&1 | tee build.log & disown

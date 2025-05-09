@@ -95,6 +95,9 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # Override the arch list for flash-attn to reduce the binary size
 ARG vllm_fa_cmake_gpu_arches='75-real;86-real;89-real;90-real;120-real'
 ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
+ENV VLLM_FLASH_ATTN_VERSION=2
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV VLLM_USE_V1=1
 #################### BASE BUILD IMAGE ####################
 ENV TRITON_CODEGEN_BACKENDS=nvidia
 RUN --mount=type=cache,target=/root/.cache/uv \
