@@ -8,7 +8,7 @@
 ARG CUDA_VERSION=12.8.1
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS base
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS base
 ARG CUDA_VERSION=12.8.1
 ARG PYTHON_VERSION=3.12
 ARG TARGETPLATFORM
@@ -47,6 +47,19 @@ RUN <<EOF
 gcc --version
 EOF
 
+# Install CMake, Ninja and the usual build tools
+RUN apt-get update -y && apt-get install -y build-essential cmake ninja-build zlib1g-dev libxml2-dev && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y \
+      clang \
+      lld \
+      libclang-dev \
+      llvm-dev \
+      libedit-dev \
+      libncurses5-dev \
+      zlib1g-dev \
+      libxml2-dev
+
 # Workaround for https://github.com/openai/triton/issues/2507 and
 # https://github.com/pytorch/pytorch/issues/107960 -- hopefully
 # this won't be needed for future versions of this docker image
@@ -77,13 +90,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # can be useful for both `dev` and `test`
 # explicitly set the list to avoid issues with torch 2.2
 # see https://github.com/pytorch/pytorch/pull/123243
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
+ARG torch_cuda_arch_list='7.5 8.6 8.9 9.0 12.0+PTX'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # Override the arch list for flash-attn to reduce the binary size
-ARG vllm_fa_cmake_gpu_arches='80-real;90-real'
+ARG vllm_fa_cmake_gpu_arches='75-real;86-real;89-real;90-real;120-real'
 ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
 #################### BASE BUILD IMAGE ####################
-
+ENV TRITON_CODEGEN_BACKENDS=nvidia
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --verbose git+https://github.com/triton-lang/triton
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
@@ -93,6 +108,7 @@ COPY requirements/build.txt requirements/build.txt
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
+ENV RUN_WHEEL_CHECK="false"
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 
@@ -106,7 +122,7 @@ RUN --mount=type=bind,source=.git,target=.git \
     if [ "$GIT_REPO_CHECK" != "0" ]; then bash tools/check_repo.sh ; fi
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=2
+ARG max_jobs=12
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
 ARG nvcc_threads=8

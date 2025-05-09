@@ -1,3 +1,12 @@
+DOCKER_BUILDKIT=1 \
+  docker build \
+  --file docker/Dockerfile \
+  --target vllm-dc \
+  --tag vllm/vllm-dc:v0.0 \
+  --build-arg max_jobs=12 \
+  --build-arg nvcc_threads=12 \
+  . 2>&1 | tee build.log & disown
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/source/assets/logos/vllm-logo-text-dark.png">
