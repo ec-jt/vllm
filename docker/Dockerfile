@@ -93,10 +93,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 12.0+PTX'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # Override the arch list for flash-attn to reduce the binary size
-ARG vllm_fa_cmake_gpu_arches='75-real;80-real;86-real;89-real;90-real;120-real'
-#ENV VLLM_FLASH_ATTN_VERSION=2
+ARG vllm_fa_cmake_gpu_arches='75-real;80-real;86-real;89-real;90-real;120-real;120-ptx'
+ENV VLLM_FLASH_ATTN_VERSION=2
 ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
-ENV VLLM_FLASH_ATTN_VERSION=1
+#ENV VLLM_FLASH_ATTN_VERSION=1
 ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 ENV VLLM_USE_V1=1
 #################### BASE BUILD IMAGE ####################
@@ -259,23 +259,20 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     uv pip install --system dist/*.whl --verbose \
     --extra-index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
-# If we need to build FlashInfer wheel before its release:
-# $ export FLASHINFER_ENABLE_AOT=1
-# $ # Note we remove 7.0 from the arch list compared to the list below, since FlashInfer only supports sm75+
-# $ export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.6 8.9 9.0+PTX'
-# $ git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-# $ cd flashinfer
-# $ git checkout 524304395bd1d8cd7d07db083859523fcaa246a4
-# $ rm -rf build
-# $ python3 setup.py bdist_wheel --dist-dir=dist --verbose
-# $ ls dist
-# $ # upload the wheel to a public location, e.g. https://wheels.vllm.ai/flashinfer/524304395bd1d8cd7d07db083859523fcaa246a4/flashinfer_python-0.2.1.post1+cu124torch2.5-cp38-abi3-linux_x86_64.whl
+## If we need to build FlashInfer wheel before its release:
+#export FLASHINFER_ENABLE_AOT=1
+## Note we remove 7.0 from the arch list compared to the list below, since FlashInfer only supports sm75+
+#git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+#cd flashinfer
+#rm -rf build
+#python3 setup.py bdist_wheel --dist-dir=dist --verbose
+#ls dist
 
 RUN --mount=type=cache,target=/root/.cache/uv \
 . /etc/environment && \
 if [ "$TARGETPLATFORM" != "linux/arm64" ]; then \
     # TESTING: install FlashInfer from source to test 2.7.0 final RC
-    FLASHINFER_ENABLE_AOT=1 TORCH_CUDA_ARCH_LIST='7.5 8.0 8.6 8.9 9.0+PTX' \
+    FLASHINFER_ENABLE_AOT=1 TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list} \
     uv pip install --system --no-build-isolation "git+https://github.com/flashinfer-ai/flashinfer@v0.2.2.post1" ; \
 fi
 COPY examples examples
