@@ -76,7 +76,7 @@ WORKDIR /workspace
 ARG torch_cuda_arch_list="8.6 8.9 12.0+PTX"
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-# Triton’s list must be a semicolon-separated string
+# Triton list must be a semicolon-separated string
 ARG triton_cuda_arch_list="8.6;8.9;12.0+PTX"
 ENV TRITON_CUDA_ARCH_LIST=${triton_cuda_arch_list}
 ENV TRITON_CODEGEN_BACKENDS=nvidia
@@ -112,6 +112,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
+
+# cuda arch list used by torch https://developer.nvidia.com/cuda-gpus
+# can be useful for both `dev` and `test`
+# explicitly set the list to avoid issues with torch 2.2
+# see https://github.com/pytorch/pytorch/pull/123243
+# build only for Ampere-30 (8.6), Ada-40 (8.9) and Lovelace-50 (12.0)
+ARG torch_cuda_arch_list="8.6 8.9 12.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
+# Triton list must be a semicolon-separated string
+ARG triton_cuda_arch_list="8.6;8.9;12.0+PTX"
+ENV TRITON_CUDA_ARCH_LIST=${triton_cuda_arch_list}
+ENV TRITON_CODEGEN_BACKENDS=nvidia
+
+# flash-attn wheel-build only needs the “real” arches
+ARG vllm_fa_cmake_gpu_arches="86-real;89-real;120-real"
+ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
+
+# vllm default envs
+ENV VLLM_FLASH_ATTN_VERSION=2
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV VLLM_USE_V1=1
 
 # install build dependencies
 COPY requirements/build.txt requirements/build.txt
@@ -213,6 +235,29 @@ WORKDIR /vllm-workspace
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETPLATFORM
 
+# cuda arch list used by torch https://developer.nvidia.com/cuda-gpus
+# can be useful for both `dev` and `test`
+# explicitly set the list to avoid issues with torch 2.2
+# see https://github.com/pytorch/pytorch/pull/123243
+# build only for Ampere-30 (8.6), Ada-40 (8.9) and Lovelace-50 (12.0)
+ARG torch_cuda_arch_list="8.6 8.9 12.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
+# Triton list must be a semicolon-separated string
+ARG triton_cuda_arch_list="8.6;8.9;12.0+PTX"
+ENV TRITON_CUDA_ARCH_LIST=${triton_cuda_arch_list}
+ENV TRITON_CODEGEN_BACKENDS=nvidia
+
+# flash-attn wheel-build only needs the “real” arches
+ARG vllm_fa_cmake_gpu_arches="86-real;89-real;120-real"
+ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
+
+# vllm default envs
+ENV VLLM_FLASH_ATTN_VERSION=2
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV VLLM_USE_V1=1
+
+
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
@@ -264,32 +309,20 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     uv pip install --system dist/*.whl --verbose \
     --extra-index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
-## Triton source install to support sm120 kernels
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --upgrade --system --verbose git+https://github.com/triton-lang/triton
-
-#RUN --mount=type=cache,target=/root/.cache/uv \
-#    git clone https://github.com/triton-lang/triton /tmp/triton && \
-#    cd /tmp/triton && \
-#    pip install --no-build-isolation --editable . && \
-#    rm -rf /tmp/triton
-
 ## If we need to build FlashInfer wheel before its release:
-#export FLASHINFER_ENABLE_AOT=1
+#ENV FLASHINFER_ENABLE_AOT=1
 ## Note we remove 7.0 from the arch list compared to the list below, since FlashInfer only supports sm75+
 #RUN --mount=type=cache,target=/root/.cache/uv \
-#git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-#cd flashinfer
-#rm -rf build
+#git clone https://github.com/flashinfer-ai/flashinfer.git --recursive \
+#cd flashinfer \
 #python3 setup.py bdist_wheel --dist-dir=dist --verbose
-#ls dist
 
 RUN --mount=type=cache,target=/root/.cache/uv \
 . /etc/environment && \
 if [ "$TARGETPLATFORM" != "linux/arm64" ]; then \
     # TESTING: install FlashInfer from source to test 2.7.0 final RC
     FLASHINFER_ENABLE_AOT=1 TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list} \
-    uv pip install --system --no-build-isolation "git+https://github.com/flashinfer-ai/flashinfer@v0.2.2.post1" ; \
+    uv pip install --system --no-build-isolation --verbose "git+https://github.com/flashinfer-ai/flashinfer@v0.2.2.post1" ; \
 fi
 COPY examples examples
 COPY benchmarks benchmarks
@@ -307,6 +340,10 @@ COPY requirements/build.txt requirements/build.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/build.txt \
     --extra-index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+
+## Triton source install to support sm120 kernels
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade --system --no-build-isolation --verbose git+https://github.com/triton-lang/triton
 
 #################### vLLM installation IMAGE ####################
 
