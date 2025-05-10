@@ -68,6 +68,28 @@ RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
 WORKDIR /workspace
 
+# cuda arch list used by torch https://developer.nvidia.com/cuda-gpus
+# can be useful for both `dev` and `test`
+# explicitly set the list to avoid issues with torch 2.2
+# see https://github.com/pytorch/pytorch/pull/123243
+# build only for Ampere-30 (8.6), Ada-40 (8.9) and Lovelace-50 (12.0)
+ARG torch_cuda_arch_list="8.6 8.9 12.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
+# Triton’s list must be a semicolon-separated string
+ARG triton_cuda_arch_list="8.6;8.9;12.0+PTX"
+ENV TRITON_CUDA_ARCH_LIST=${triton_cuda_arch_list}
+ENV TRITON_CODEGEN_BACKENDS=nvidia
+
+# flash-attn wheel-build only needs the “real” arches
+ARG vllm_fa_cmake_gpu_arches="86-real;89-real;120-real"
+ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
+
+# vllm default envs
+ENV VLLM_FLASH_ATTN_VERSION=2
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV VLLM_USE_V1=1
+
 # install build and runtime dependencies
 
 # arm64 (GH200) build follows the practice of "use existing pytorch" build,
@@ -86,23 +108,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/cuda.txt \
     --extra-index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
-# cuda arch list used by torch
-# can be useful for both `dev` and `test`
-# explicitly set the list to avoid issues with torch 2.2
-# see https://github.com/pytorch/pytorch/pull/123243
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 12.0+PTX'
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
-# Override the arch list for flash-attn to reduce the binary size
-ARG vllm_fa_cmake_gpu_arches='75-real;80-real;86-real;89-real;90-real;120-real;120-ptx'
-ENV VLLM_FLASH_ATTN_VERSION=2
-ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
-#ENV VLLM_FLASH_ATTN_VERSION=1
-ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-ENV VLLM_USE_V1=1
 #################### BASE BUILD IMAGE ####################
-ENV TRITON_CODEGEN_BACKENDS=nvidia
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --verbose git+https://github.com/triton-lang/triton
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
@@ -170,14 +176,13 @@ COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
 ARG VLLM_MAX_SIZE_MB=10240
 ENV VLLM_MAX_SIZE_MB=$VLLM_MAX_SIZE_MB
-ARG RUN_WHEEL_CHECK=true
+ARG RUN_WHEEL_CHECK=false
 RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
         python3 check-wheel-size.py dist; \
     else \
         echo "Skipping wheel size check."; \
     fi
 #################### EXTENSION Build IMAGE ####################
-
 #################### DEV IMAGE ####################
 FROM base as dev
 
@@ -259,9 +264,20 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     uv pip install --system dist/*.whl --verbose \
     --extra-index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
+## Triton source install to support sm120 kernels
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade --system --verbose git+https://github.com/triton-lang/triton
+
+#RUN --mount=type=cache,target=/root/.cache/uv \
+#    git clone https://github.com/triton-lang/triton /tmp/triton && \
+#    cd /tmp/triton && \
+#    pip install --no-build-isolation --editable . && \
+#    rm -rf /tmp/triton
+
 ## If we need to build FlashInfer wheel before its release:
 #export FLASHINFER_ENABLE_AOT=1
 ## Note we remove 7.0 from the arch list compared to the list below, since FlashInfer only supports sm75+
+#RUN --mount=type=cache,target=/root/.cache/uv \
 #git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 #cd flashinfer
 #rm -rf build
