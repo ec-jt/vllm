@@ -62,8 +62,10 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
+        # Match parameters using structural boundaries instead of </parameter> tag
+        # This allows </parameter> to appear in parameter content
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            r"<parameter=(.*?)(?:(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
         )
 
@@ -287,6 +289,9 @@ class Qwen3CoderToolParser(ToolParser):
                 param_value = param_value[1:]
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
+
+            # Strip trailing </parameter> tag if present (since we use structural boundaries)
+            param_value = re.sub(r'\s*</parameter>\s*$', '', param_value)
 
             param_dict[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, function_name
@@ -512,11 +517,9 @@ class Qwen3CoderToolParser(ToolParser):
                     # IMPORTANT: Add to prev_tool_call_arr immediately when
                     # we detect a tool call. This ensures
                     # finish_reason="tool_calls" even if parsing isn't complete
-                    already_added = any(
-                        tool.get("name") == self.current_function_name
-                        for tool in self.prev_tool_call_arr
-                    )
-                    if not already_added:
+                    # Use index-based tracking to support duplicate tool names
+                    # (e.g., two calls to the same "read" function)
+                    if self.current_tool_index >= len(self.prev_tool_call_arr):
                         self.prev_tool_call_arr.append(
                             {
                                 "name": self.current_function_name,
@@ -582,11 +585,10 @@ class Qwen3CoderToolParser(ToolParser):
                         if parsed_tool:
                             # Update existing entry in
                             # prev_tool_call_arr with complete args
-                            for i, tool in enumerate(self.prev_tool_call_arr):
-                                if tool.get("name") == parsed_tool.function.name:
-                                    args = parsed_tool.function.arguments
-                                    self.prev_tool_call_arr[i]["arguments"] = args
-                                    break
+                            # Use index-based update to support duplicate tool names
+                            if self.current_tool_index < len(self.prev_tool_call_arr):
+                                args = parsed_tool.function.arguments
+                                self.prev_tool_call_arr[self.current_tool_index]["arguments"] = args
                     except Exception:
                         pass  # Ignore parsing errors during streaming
 
@@ -649,13 +651,20 @@ class Qwen3CoderToolParser(ToolParser):
                     )
                 else:
                     # Parameter still streaming - emit safe content
-                    # Check for partial </parameter> at end of buffer
+                    # Hold back trailing \n and partial </parameter> tags.
+                    # In Qwen3-Coder format, \n precedes </parameter> as a
+                    # delimiter and should not be part of the value.
                     current_value = value_text
-                    if current_value.endswith("\n"):
-                        current_value = current_value[:-1]
 
                     # Find content safe to emit (not part of closing tag)
+                    # Check for partial </parameter> at end of buffer
                     safe_len = len(current_value)
+
+                    # Hold back trailing \n (delimiter before </parameter>)
+                    if current_value.endswith("\n"):
+                        safe_len = len(current_value) - 1
+                    
+                    # Hold back partial </parameter> tag matches
                     for i in range(1, len(self.parameter_end_token)):
                         if current_value.endswith(
                             self.parameter_end_token[:i]
