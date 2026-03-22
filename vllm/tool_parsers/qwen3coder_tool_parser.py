@@ -121,6 +121,58 @@ class Qwen3CoderToolParser(ToolParser):
             return ""
         return json.dumps(s, ensure_ascii=False)[1:-1]
 
+    def _ensure_streaming_tool_state(self, tool_index: int) -> None:
+        """Ensure per-tool arrays are allocated for the given index."""
+        while len(self.streamed_args_for_tool) <= tool_index:
+            self.streamed_args_for_tool.append("")
+        while len(self.prev_tool_call_arr) <= tool_index:
+            self.prev_tool_call_arr.append({"name": "", "arguments": "{}"})
+
+    def _emit_tool_args_delta(self, fragment: str) -> DeltaMessage | None:
+        """Emit a tool args fragment and keep streamed state synchronized."""
+        if not fragment:
+            return None
+
+        self._ensure_streaming_tool_state(self.current_tool_index)
+        self.streamed_args_for_tool[self.current_tool_index] += fragment
+        return DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=self.current_tool_index,
+                    function=DeltaFunctionCall(arguments=fragment),
+                )
+            ]
+        )
+
+    def _sync_current_tool_call_arguments(
+        self,
+        tool_text: str,
+        request: ChatCompletionRequest,
+    ) -> None:
+        """Sync finalized function args into prev_tool_call_arr when parsable."""
+        if self.current_tool_index >= len(self.prev_tool_call_arr):
+            return
+        if (
+            self.tool_call_prefix not in tool_text
+            or self.function_end_token not in tool_text
+        ):
+            return
+
+        start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
+        end = tool_text.find(self.function_end_token, start)
+        if end == -1:
+            return
+
+        function_call_str = tool_text[start:end]
+        parsed = self._parse_xml_function_call(function_call_str, request.tools)
+        if parsed is None:
+            return
+
+        self.prev_tool_call_arr[self.current_tool_index] = {
+            "name": parsed.function.name,
+            "arguments": parsed.function.arguments,
+        }
+
     def _is_string_type(self, param_name: str) -> bool:
         """Check if a parameter is string type based on tool schema."""
         if not self.streaming_request or not self.streaming_request.tools:
@@ -402,6 +454,8 @@ class Qwen3CoderToolParser(ToolParser):
         if not previous_text:
             self._reset_streaming_state()
             self.streaming_request = request
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = []
 
         # If no delta text, return None unless it's an EOS token after tools
         if not delta_text:
@@ -538,19 +592,18 @@ class Qwen3CoderToolParser(ToolParser):
                     # Always append — each tool call is a separate
                     # invocation even if the function name is the same
                     # (e.g. two consecutive "read" calls).
-                    self.prev_tool_call_arr.append(
-                        {
-                            "name": self.current_function_name,
-                            "arguments": "{}",
-                        }
-                    )
+                    self._ensure_streaming_tool_state(self.current_tool_index)
+                    self.prev_tool_call_arr[self.current_tool_index] = {
+                        "name": self.current_function_name,
+                        "arguments": "{}",
+                    }
 
                     # Initialize streamed args tracking for this tool.
                     # The serving layer reads streamed_args_for_tool to
                     # compute remaining arguments at stream end. Without
                     # this, IndexError occurs when the serving layer
                     # accesses streamed_args_for_tool[index].
-                    self.streamed_args_for_tool.append("")
+                    self.streamed_args_for_tool[self.current_tool_index] = ""
 
                     # Send header with function info
                     return DeltaMessage(
@@ -576,15 +629,7 @@ class Qwen3CoderToolParser(ToolParser):
             # json_started from what was actually streamed.
             if not self.json_started:
                 self.json_started = True
-                self.streamed_args_for_tool[self.current_tool_index] += "{"
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="{"),
-                        )
-                    ]
-                )
+                return self._emit_tool_args_delta("{")
 
             # -------------------------------------------------------
             # Handle incremental string value streaming
@@ -604,9 +649,22 @@ class Qwen3CoderToolParser(ToolParser):
                 if value_text.startswith("\n"):
                     value_text = value_text[1:]
 
-                # Check if the parameter value is complete
-                val_end = value_text.find(self.parameter_end_token)
-                if val_end != -1:
+                # Check if parameter value is complete. Function/tool close can
+                # also terminate a parameter in malformed/fragmented streams.
+                boundary_candidates: list[tuple[int, str]] = []
+                for token, kind in (
+                    (self.parameter_end_token, "parameter"),
+                    (self.function_end_token, "function"),
+                    (self.tool_call_end_token, "tool"),
+                ):
+                    pos = value_text.find(token)
+                    if pos != -1:
+                        boundary_candidates.append((pos, kind))
+
+                if boundary_candidates:
+                    val_end, boundary_kind = min(
+                        boundary_candidates, key=lambda x: x[0]
+                    )
                     # Parameter complete - emit remaining content and
                     # close the JSON string quote
                     remaining_value = value_text[:val_end]
@@ -619,14 +677,14 @@ class Qwen3CoderToolParser(ToolParser):
 
                     escaped = self._json_escape_string_content(new_content)
                     frag = escaped + '"'
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                function=DeltaFunctionCall(arguments=frag),
-                            )
-                        ]
-                    )
+
+                    if boundary_kind in {"function", "tool"}:
+                        self._sync_current_tool_call_arguments(tool_text, request)
+                        self.in_function = False
+                        self.json_closed = True
+                        frag += "}"
+
+                    return self._emit_tool_args_delta(frag)
                 else:
                     # Parameter still streaming - emit safe content
                     # Hold back trailing \n and partial </parameter> tags.
@@ -642,31 +700,25 @@ class Qwen3CoderToolParser(ToolParser):
                     if current_value.endswith("\n"):
                         safe_len = len(current_value) - 1
 
-                    # Hold back partial </parameter> tag matches
-                    # (also covers \n + partial tag, e.g. "\n<" or "\n</")
-                    for i in range(1, len(self.parameter_end_token)):
-                        if current_value.endswith(self.parameter_end_token[:i]):
-                            safe_len = len(current_value) - i
-                            break
+                    # Hold back partial close-tag suffixes
+                    # (covers \n + partial tags, e.g. "\n<" or "\n</f").
+                    for close_token in (
+                        self.parameter_end_token,
+                        self.function_end_token,
+                        self.tool_call_end_token,
+                    ):
+                        for i in range(1, len(close_token)):
+                            if current_value.endswith(close_token[:i]):
+                                safe_len = min(safe_len, len(current_value) - i)
+                                break
 
-                    safe_value = current_value[:safe_len]
-                    # Strip trailing \n that precedes </parameter> —
-                    # it's a Qwen3-Coder delimiter, not part of the value
-                    if safe_value.endswith("\n"):
-                        safe_value = safe_value[:-1]
+                    safe_value = current_value[: max(safe_len, 0)]
                     new_content = safe_value[len(self._value_buffer) :]
                     if new_content:
                         self._value_buffer = safe_value
                         escaped = self._json_escape_string_content(new_content)
                         if escaped:
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_index,
-                                        function=DeltaFunctionCall(arguments=escaped),
-                                    )
-                                ]
-                            )
+                            return self._emit_tool_args_delta(escaped)
                     return None
 
             # -------------------------------------------------------
@@ -715,35 +767,35 @@ class Qwen3CoderToolParser(ToolParser):
                         self._streaming_string_value = True
                         self._value_buffer = ""
 
-                        return DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_index,
-                                    function=DeltaFunctionCall(arguments=key_frag),
-                                )
-                            ]
-                        )
+                        return self._emit_tool_args_delta(key_frag)
                     else:
                         # -----------------------------------------
                         # Non-string type: wait for complete value
                         # -----------------------------------------
                         param_end_idx = value_text.find(self.parameter_end_token)
+                        boundary_kind = "parameter"
                         if param_end_idx == -1:
                             # No closing tag yet, look for boundaries
                             next_param_idx = value_text.find(self.parameter_prefix)
                             func_end_idx = value_text.find(self.function_end_token)
+                            tool_end_idx = value_text.find(self.tool_call_end_token)
 
-                            if next_param_idx != -1 and (
-                                func_end_idx == -1 or next_param_idx < func_end_idx
-                            ):
-                                param_end_idx = next_param_idx
-                            elif func_end_idx != -1:
-                                param_end_idx = func_end_idx
+                            boundary_candidates = []
+                            if next_param_idx != -1:
+                                boundary_candidates.append(
+                                    (next_param_idx, "next_param")
+                                )
+                            if func_end_idx != -1:
+                                boundary_candidates.append((func_end_idx, "function"))
+                            if tool_end_idx != -1:
+                                boundary_candidates.append((tool_end_idx, "tool"))
+
+                            if boundary_candidates:
+                                param_end_idx, boundary_kind = min(
+                                    boundary_candidates, key=lambda x: x[0]
+                                )
                             else:
-                                if self.tool_call_end_token in tool_text:
-                                    param_end_idx = len(value_text)
-                                else:
-                                    return None
+                                return None
 
                         if param_end_idx != -1:
                             param_value = value_text[:param_end_idx]
@@ -783,15 +835,27 @@ class Qwen3CoderToolParser(ToolParser):
 
                             self.param_count += 1
 
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_index,
-                                        function=DeltaFunctionCall(
-                                            arguments=json_fragment
-                                        ),
-                                    )
-                                ]
-                            )
+                            if boundary_kind in {"function", "tool"}:
+                                self._sync_current_tool_call_arguments(
+                                    tool_text, request
+                                )
+                                self.in_function = False
+                                self.json_closed = True
+                                json_fragment += "}"
+
+                            return self._emit_tool_args_delta(json_fragment)
+
+            # Function ended and all started parameters have been flushed:
+            # emit closing brace exactly once.
+            if (
+                not self.json_closed
+                and not self._streaming_string_value
+                and self.function_end_token in tool_text
+                and self.param_count >= tool_text.count(self.parameter_prefix)
+            ):
+                self._sync_current_tool_call_arguments(tool_text, request)
+                self.in_function = False
+                self.json_closed = True
+                return self._emit_tool_args_delta("}")
 
         return None
