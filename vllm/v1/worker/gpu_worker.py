@@ -786,6 +786,22 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
+            pp_debug = os.getenv("DBG_NCCL_TRACE_DEPTH", "minimal").strip().lower() in (
+                "watchdog",
+                "1",
+                "true",
+                "yes",
+            )
+            if pp_debug:
+                logger.info(
+                    "[PP-WORKER-RECV] global_rank=%s pp_rank=%s expecting_from_pp_rank=%s scheduled_reqs=%s scheduled_tokens=%s",
+                    self.rank,
+                    get_pp_group().rank_in_group,
+                    (get_pp_group().rank_in_group - 1) % get_pp_group().world_size,
+                    len(scheduler_output.num_scheduled_tokens),
+                    num_scheduled_tokens,
+                )
+
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -793,6 +809,13 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            if pp_debug:
+                logger.info(
+                    "[PP-WORKER-RECV] received_tensor_keys=%s handle_count=%s postprocess_count=%s",
+                    list(tensor_dict.keys())[:8],
+                    len(comm_handles),
+                    len(comm_postprocess),
+                )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,

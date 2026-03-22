@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -3146,10 +3147,26 @@ class GPUModelRunner(
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
 
+        pp_debug = os.getenv("DBG_NCCL_TRACE_DEPTH", "minimal").strip().lower() in (
+            "watchdog",
+            "1",
+            "true",
+            "yes",
+        )
+
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
             self.discard_request_mask.np[:num_reqs]
         )[0]
+
+        if pp_debug:
+            logger.info(
+                "[PP-SAMPLE-BOOKKEEP] reqs=%s sampled_shape=%s discard_count=%s use_async=%s",
+                num_reqs,
+                tuple(sampler_output.sampled_token_ids.shape),
+                len(discard_sampled_tokens_req_indices),
+                self.use_async_scheduling,
+            )
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
             if gen is not None:
@@ -6653,10 +6670,34 @@ class GPUModelRunner(
         # this is in the critical path of every single model
         # forward loop, this has caused perf issue for a disagg
         # setup.
+        pp_debug = os.getenv("DBG_NCCL_TRACE_DEPTH", "minimal").strip().lower() in (
+            "watchdog",
+            "1",
+            "true",
+            "yes",
+        )
+
+        if pp_debug:
+            logger.info(
+                "[PP-SAMPLE-TO-LIST] sampled_shape=%s dtype=%s device=%s",
+                tuple(sampled_token_ids.shape),
+                sampled_token_ids.dtype,
+                sampled_token_ids.device,
+            )
+
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
+
+        sync_start = time.perf_counter() if pp_debug else None
         self.transfer_event.synchronize()
+
+        if pp_debug and sync_start is not None:
+            logger.info(
+                "[PP-SAMPLE-TO-LIST] transfer_event_sync_ms=%.3f",
+                (time.perf_counter() - sync_start) * 1000,
+            )
+
         return pinned.tolist()
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:

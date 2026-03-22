@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -68,6 +69,11 @@ class GraphCaptureContext:
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+
+def _pp_watchdog_debug_enabled() -> bool:
+    mode = os.getenv("DBG_NCCL_TRACE_DEPTH", "minimal").strip().lower()
+    return mode in ("watchdog", "1", "true", "yes")
 
 
 class Handle(Protocol):
@@ -979,8 +985,20 @@ class GroupCoordinator:
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
+        pp_debug = _pp_watchdog_debug_enabled()
 
-        for key, value in recv_metadata_list:
+        if pp_debug:
+            logger.info(
+                "[PP-RECV] global_rank=%s pp_rank=%s src_pp_rank=%s src_global_rank=%s metadata_items=%s all_gather_size=%s",
+                getattr(self, "rank", -1),
+                self.rank_in_group,
+                src,
+                self.ranks[src],
+                len(recv_metadata_list),
+                all_gather_size,
+            )
+
+        for idx, (key, value) in enumerate(recv_metadata_list):
             if isinstance(value, TensorMetadata):
                 full_tensor = torch.empty(
                     value.size, dtype=value.dtype, device=value.device
@@ -989,9 +1007,21 @@ class GroupCoordinator:
                     tensor_dict[key] = full_tensor
                     continue
 
-                if self._should_use_all_gather(
+                use_all_gather = self._should_use_all_gather(
                     key, full_tensor.numel(), all_gather_group, all_gather_tensors
-                ):
+                )
+
+                if pp_debug and idx < 8:
+                    logger.info(
+                        "[PP-RECV] key=%s shape=%s dtype=%s device=%s use_all_gather=%s",
+                        key,
+                        tuple(full_tensor.shape),
+                        str(full_tensor.dtype),
+                        str(full_tensor.device),
+                        use_all_gather,
+                    )
+
+                if use_all_gather:
                     orig_shape = full_tensor.shape
                     slice_tensor = full_tensor.reshape(all_gather_size, -1)[
                         all_gather_rank
@@ -1024,6 +1054,13 @@ class GroupCoordinator:
                     tensor_dict[key] = full_tensor
             else:
                 tensor_dict[key] = value
+
+        if pp_debug:
+            logger.info(
+                "[PP-RECV] queued_irecv_handles=%s postprocess_ops=%s",
+                len(handles),
+                len(postprocess),
+            )
 
         return tensor_dict, handles, postprocess
 
